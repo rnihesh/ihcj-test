@@ -163,8 +163,8 @@ def validate_and_correct_json(court_code_dl, date):
                 print(f"[WARN] Could not decode JSON from {json_file_path}, skipping.")
 
 def run_downloader(court_code_dl, start_date):
-    # end_date = start_date + timedelta(days=1)
-    end_date = datetime.now().date()
+    end_date = start_date + timedelta(days=1)
+    # end_date = datetime.now().date()
     print(f"\nRunning downloader for court={court_code_dl} from {start_date} to {end_date} ...")
     cmd = [
         "python", DOWNLOAD_SCRIPT,
