@@ -186,7 +186,48 @@ def file_md5(path):
     return hash_md5.hexdigest()
 
 def s3_key_from_local(local_path):
-    return str(local_path.relative_to(OUTPUT_DIR)).replace("\\", "/")
+    """
+    Maps local file structure to desired S3 structure:
+    - PDFs go to: data/pdf/year=YYYY/court=X_Y/bench=BENCH/filename.pdf
+    - Tars go to: data/tar/year=YYYY/court=X_Y/bench=BENCH/pdfs.tar
+    """
+    relative_path = local_path.relative_to(OUTPUT_DIR)
+    
+    # Parse the local path to extract components
+    parts = relative_path.parts
+    
+    if len(parts) >= 4:
+        # Expected structure: some_path/year/court_code/bench/filename
+        # Find year, court, and bench from the path
+        year_part = None
+        court_part = None
+        bench_part = None
+        
+        for i, part in enumerate(parts):
+            if part.isdigit() and len(part) == 4:  # Year
+                year_part = f"year={part}"
+                if i + 1 < len(parts):
+                    court_part = f"court={parts[i + 1]}"
+                if i + 2 < len(parts):
+                    bench_part = f"bench={parts[i + 2]}"
+                break
+        
+        if year_part and court_part and bench_part:
+            filename = parts[-1]
+            
+            # Determine if it's a PDF or tar file
+            if filename.endswith('.pdf'):
+                return f"data/pdf/{year_part}/{court_part}/{bench_part}/{filename}"
+            elif filename.endswith('.tar') or 'pdfs' in filename:
+                # For tar files, use pdfs.tar as the filename
+                return f"data/tar/{year_part}/{court_part}/{bench_part}/pdfs.tar"
+            elif filename.endswith('.json'):
+                return f"metadata/json/{year_part}/{court_part}/{bench_part}/{filename}"
+            elif filename.endswith('.parquet'):
+                return f"metadata/parquet/{year_part}/{court_part}/{bench_part}/{filename}"
+    
+    # Fallback to original behavior if parsing fails
+    return str(relative_path).replace("\\", "/")
 
 def s3_object_exists(s3, bucket, key):
     try:
