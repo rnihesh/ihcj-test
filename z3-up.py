@@ -9,6 +9,7 @@ from tqdm import tqdm
 import subprocess
 import hashlib
 from pathlib import Path
+import sys
 
 # ---- CONFIG ----
 S3_BUCKET = "indian-high-court-judgments"
@@ -166,6 +167,8 @@ def run_downloader(court_code_dl, start_date):
     end_date = start_date + timedelta(days=1)
     # end_date = datetime.now().date()
     print(f"\nRunning downloader for court={court_code_dl} from {start_date} to {end_date} ...")
+    sys.stdout.flush()  # Force flush before subprocess
+    
     cmd = [
         "python", DOWNLOAD_SCRIPT,
         "--court_code", court_code_dl,
@@ -174,7 +177,26 @@ def run_downloader(court_code_dl, start_date):
         "--day_step", "2"
     ]
     print("Command:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    sys.stdout.flush()
+    
+    # Use subprocess with proper output handling
+    process = subprocess.Popen(
+        cmd, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT, 
+        universal_newlines=True,
+        bufsize=1
+    )
+    
+    # Read output line by line
+    for line in process.stdout:
+        print(f"[DOWNLOADER] {line.rstrip()}")
+        sys.stdout.flush()
+    
+    process.wait()
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, cmd)
+        
     validate_and_correct_json(court_code_dl, start_date)
 
 # --- UPLOAD/MERGE LOGIC ---
