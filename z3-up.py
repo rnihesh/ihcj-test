@@ -11,7 +11,7 @@ import hashlib
 from pathlib import Path
 
 # ---- CONFIG ----
-S3_BUCKET = "indian-high-court-judgments-test"
+S3_BUCKET = "indian-high-court-judgments"
 S3_PREFIX = "metadata/json/"
 LOCAL_DIR = "./local_hc_metadata"
 DOWNLOAD_SCRIPT = "./download.py"
