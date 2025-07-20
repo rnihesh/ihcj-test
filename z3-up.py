@@ -164,7 +164,8 @@ def validate_and_correct_json(court_code_dl, date):
                 print(f"[WARN] Could not decode JSON from {json_file_path}, skipping.")
 
 def run_downloader(court_code_dl, start_date):
-    end_date = start_date + timedelta(days=1)
+    # end_date = start_date + timedelta(days=1)
+    end_date = start_date
     # end_date = datetime.now().date()
     print(f"\nRunning downloader for court={court_code_dl} from {start_date} to {end_date} ...")
     sys.stdout.flush()  # Force flush before subprocess
@@ -211,45 +212,41 @@ def s3_key_from_local(local_path):
     """
     Maps local file structure to desired S3 structure:
     - PDFs go to: data/pdf/year=YYYY/court=X_Y/bench=BENCH/filename.pdf
-    - Tars go to: data/tar/year=YYYY/court=X_Y/bench=BENCH/pdfs.tar
+    - JSON go to: metadata/json/year=YYYY/court=X_Y/bench=BENCH/filename.json
+    - Tars go to: data/tar/year=YYYY/court=X_Y/bench=BENCH/filename.tar
+    - Parquet go to: metadata/parquet/year=YYYY/court=X_Y/bench=BENCH/filename.parquet
     """
     relative_path = local_path.relative_to(OUTPUT_DIR)
-    
-    # Parse the local path to extract components
     parts = relative_path.parts
     
-    if len(parts) >= 4:
-        # Expected structure: some_path/year/court_code/bench/filename
-        # Find year, court, and bench from the path
-        year_part = None
-        court_part = None
-        bench_part = None
+    print(f"DEBUG: Processing {relative_path}")
+    
+    # Expected structure: YEAR/COURT_CODE/BENCH/FILENAME
+    if len(parts) >= 3:
+        year = parts[0]
+        court_code = parts[1] 
+        bench = parts[2]
+        filename = parts[-1]
         
-        for i, part in enumerate(parts):
-            if part.isdigit() and len(part) == 4:  # Year
-                year_part = f"year={part}"
-                if i + 1 < len(parts):
-                    court_part = f"court={parts[i + 1]}"
-                if i + 2 < len(parts):
-                    bench_part = f"bench={parts[i + 2]}"
-                break
-        
-        if year_part and court_part and bench_part:
-            filename = parts[-1]
+        # Validate year format
+        if year.isdigit() and len(year) == 4:
+            year_part = f"year={year}"
+            court_part = f"court={court_code}"
+            bench_part = f"bench={bench}"
             
-            # Determine if it's a PDF or tar file
+            # Determine file type and create proper S3 key
             if filename.endswith('.pdf'):
                 return f"data/pdf/{year_part}/{court_part}/{bench_part}/{filename}"
-            elif filename.endswith('.tar') or 'pdfs' in filename:
-                # For tar files, use pdfs.tar as the filename
-                return f"data/tar/{year_part}/{court_part}/{bench_part}/pdfs.tar"
             elif filename.endswith('.json'):
                 return f"metadata/json/{year_part}/{court_part}/{bench_part}/{filename}"
+            elif filename.endswith('.tar'):
+                return f"data/tar/{year_part}/{court_part}/{bench_part}/{filename}"
             elif filename.endswith('.parquet'):
                 return f"metadata/parquet/{year_part}/{court_part}/{bench_part}/{filename}"
     
-    # Fallback to original behavior if parsing fails
-    return str(relative_path).replace("\\", "/")
+    # If structure doesn't match, skip this file
+    print(f"WARNING: Skipping file with unexpected structure: {relative_path}")
+    return None
 
 def s3_object_exists(s3, bucket, key):
     try:
@@ -279,7 +276,7 @@ def merge_json(local_path, s3, bucket, key):
     merged = {json.dumps(item, sort_keys=True): item for item in remote_data + local_data}
     merged_list = list(merged.values())
     with open("merged_tmp.json", "w") as f:
-        json.dump(merged_list, f)
+        json.dump(merged_list, f, indent=4)
     upload_file(s3, "merged_tmp.json", bucket, key)
     os.remove("merged_tmp.json")
     print(f"Merged JSON: {key}")
@@ -310,11 +307,17 @@ def upload_and_merge_all():
     s3 = session.client("s3")
     
     for local_path in OUTPUT_DIR.rglob("*"):
-        if local_path.is_dir(): continue
+        if local_path.is_dir(): 
+            continue
+            
         key = s3_key_from_local(local_path)
+        if key is None:  # Skip files that don't match expected structure
+            continue
+            
         bucket = TEST_BUCKET
         print(f"Checking {key}...")
         exists = s3_object_exists(s3, bucket, key)
+        
         # Merge/upload logic
         if local_path.suffix == ".json":
             if exists:
@@ -344,6 +347,91 @@ def upload_and_merge_all():
             if not exists:
                 upload_file(s3, local_path, bucket, key)
 
+def reorganize_downloaded_files():
+    """
+    Reorganize downloaded files from eCourts structure to S3 structure
+    From: data/court/cnrorders/BENCH/orders/FILENAME
+    To: data/YEAR/COURT_CODE/BENCH/FILENAME
+    """
+    print("Reorganizing downloaded files...")
+    
+    # Find all downloaded files
+    court_dir = OUTPUT_DIR / "court"
+    if not court_dir.exists():
+        print("No court directory found, nothing to reorganize")
+        return
+    
+    cnr_dir = court_dir / "cnrorders"
+    if not cnr_dir.exists():
+        print("No cnrorders directory found")
+        return
+    
+    # Process each bench directory
+    for bench_dir in cnr_dir.iterdir():
+        if not bench_dir.is_dir():
+            continue
+            
+        bench_name = bench_dir.name  # FIX: was "bench" instead of "bench_dir.name"
+        orders_dir = bench_dir / "orders"
+        
+        if not orders_dir.exists():
+            continue
+            
+        print(f"Processing bench: {bench_name}")
+        
+        # Process all files in the orders directory
+        for file_path in orders_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+                
+            # Extract year from filename (e.g., JKHC020008342013_1_2025-03-04.json)
+            year_match = re.search(r'_(\d{4})-\d{2}-\d{2}\.', file_path.name)
+            if not year_match:
+                print(f"Could not extract year from {file_path.name}")
+                continue
+                
+            year = year_match.group(1)
+            
+            # Map bench to court code
+            court_code = get_court_code_from_bench(bench_name)
+            
+            # Create new directory structure
+            new_dir = OUTPUT_DIR / year / court_code / bench_name
+            new_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Move file to new location
+            new_path = new_dir / file_path.name
+            if not new_path.exists():
+                file_path.rename(new_path)
+                print(f"Moved: {file_path} -> {new_path}")
+    
+    # Remove the old court directory after reorganization
+    import shutil
+    shutil.rmtree(court_dir)
+    print("Removed old court directory structure")
+
+def get_court_code_from_bench(bench_name):
+    """
+    Map bench name to court code based on the codebase mappings
+    """
+    # Based on the ATHENA.md mappings
+    bench_to_court = {
+        'jammuhc': '1_12',
+        'kashmirhc': '1_12',
+        'taphc': '36_29',
+        'aphc': '28_2',
+        'calcutta_circuit_bench_at_jalpaiguri': '19_16',
+        'calcutta_original_side': '19_16',
+        'calcutta_circuit_bench_at_port_blair': '19_16',
+        'nlghccis': '18_6',
+        'azghccis': '18_6',
+        'arghccis': '18_6',
+        'asghccis': '18_6',
+        # Add more mappings as needed
+    }
+    
+    return bench_to_court.get(bench_name, '1_12')  # Default to 1_12 if not found
+
 def main():
     year = datetime.now().year
     os.makedirs(LOCAL_DIR, exist_ok=True)
@@ -367,7 +455,6 @@ def main():
                 if m:
                     try:
                         d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-                        # Skip future dates when reporting latest date
                         if d <= datetime.now().date():
                             all_dates.add(d)
                         else:
@@ -391,7 +478,6 @@ def main():
                     if m:
                         try:
                             d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-                            # Only add dates from the current year to prevent processing old data
                             if d.year == year and d <= datetime.now().date():
                                 all_dates.add(d)
                         except Exception:
@@ -403,10 +489,9 @@ def main():
                 
             court_code_dl = test_court_code.replace('_', '~')
             
-            # Debug to show all dates before processing
             print(f"[DEBUG] All dates for court {test_court_code}: {sorted(all_dates)}")
             
-            # Process all dates for the test court, not just the earliest
+            # Process all dates for the test court
             for dt in sorted(all_dates):
                 run_downloader(court_code_dl, dt)
                 
@@ -415,12 +500,87 @@ def main():
     else:
         print(f"[WARN] Test court code {test_court_code} not found in S3 data.")
 
-    print("\nAll done. If new packages were generated, you may now proceed to upload to S3.")
+    print("\nAll done downloading. Now reorganizing files...")
+    
+    # ---- REORGANIZE DOWNLOADED FILES ----
+    reorganize_downloaded_files()
+    
+    # ---- CREATE TAR AND PARQUET FILES ----
+    create_tar_and_parquet_files()
 
+    print("\nFile reorganization complete. Starting upload/merge to test bucket...")
+    
     # ---- UPLOAD AND MERGE TO TEST BUCKET ----
-    print("\nStarting upload/merge to test bucket...")
     upload_and_merge_all()
     print("Upload/merge complete.")
+
+def create_tar_and_parquet_files():
+    """
+    Create tar files for PDFs and parquet files for metadata
+    """
+    print("Creating tar and parquet files...")
+    
+    # Process each year/court/bench directory
+    for year_dir in OUTPUT_DIR.iterdir():
+        if not year_dir.is_dir() or not year_dir.name.isdigit():
+            continue
+            
+        for court_dir in year_dir.iterdir():
+            if not court_dir.is_dir():
+                continue
+                
+            for bench_dir in court_dir.iterdir():
+                if not bench_dir.is_dir():
+                    continue
+                    
+                print(f"Processing {year_dir.name}/{court_dir.name}/{bench_dir.name}")
+                
+                # Create parquet from JSON files
+                json_files = list(bench_dir.glob("*.json"))
+                if json_files:
+                    parquet_path = bench_dir / "metadata.parquet"
+                    if not parquet_path.exists():
+                        create_parquet_from_json(json_files, parquet_path)
+                
+                # Create tar from PDF files
+                pdf_files = list(bench_dir.glob("*.pdf"))
+                if pdf_files:
+                    tar_path = bench_dir / "pdfs.tar"
+                    if not tar_path.exists():
+                        create_tar_from_pdfs(pdf_files, tar_path)
+
+def create_parquet_from_json(json_files, output_path):
+    """Create parquet file from JSON metadata files"""
+    try:
+        import pandas as pd
+        
+        all_data = []
+        for json_file in json_files:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    all_data.extend(data)
+                else:
+                    all_data.append(data)
+        
+        if all_data:
+            df = pd.DataFrame(all_data)
+            df.to_parquet(output_path, index=False)
+            print(f"Created parquet: {output_path}")
+    except Exception as e:
+        print(f"Error creating parquet {output_path}: {e}")
+
+def create_tar_from_pdfs(pdf_files, output_path):
+    """Create tar file from PDF files"""
+    try:
+        import tarfile
+        
+        with tarfile.open(output_path, 'w') as tar:
+            for pdf_file in pdf_files:
+                tar.add(pdf_file, arcname=pdf_file.name)
+        print(f"Created tar: {output_path}")
+    except Exception as e:
+        print(f"Error creating tar {output_path}: {e}")
 
 if __name__ == "__main__":
     main()
