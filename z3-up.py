@@ -213,8 +213,9 @@ def s3_key_from_local(local_path):
     Maps local file structure to desired S3 structure:
     - PDFs go to: data/pdf/year=YYYY/court=X_Y/bench=BENCH/filename.pdf
     - JSON go to: metadata/json/year=YYYY/court=X_Y/bench=BENCH/filename.json
-    - Tars go to: data/tar/year=YYYY/court=X_Y/bench=BENCH/filename.tar
+    - PDF Tars go to: data/tar/year=YYYY/court=X_Y/bench=BENCH/filename.tar
     - Parquet go to: metadata/parquet/year=YYYY/court=X_Y/bench=BENCH/filename.parquet
+    - JSON Tars go to: metadata/tar/year=YYYY/court=X_Y/bench=BENCH/metadata.tar.gz
     """
     relative_path = local_path.relative_to(OUTPUT_DIR)
     parts = relative_path.parts
@@ -239,8 +240,10 @@ def s3_key_from_local(local_path):
                 return f"data/pdf/{year_part}/{court_part}/{bench_part}/{filename}"
             elif filename.endswith('.json'):
                 return f"metadata/json/{year_part}/{court_part}/{bench_part}/{filename}"
-            elif filename.endswith('.tar'):
+            elif filename == 'pdfs.tar':
                 return f"data/tar/{year_part}/{court_part}/{bench_part}/{filename}"
+            elif filename == 'metadata.tar.gz':
+                return f"metadata/tar/{year_part}/{court_part}/{bench_part}/{filename}"
             elif filename.endswith('.parquet'):
                 return f"metadata/parquet/{year_part}/{court_part}/{bench_part}/{filename}"
     
@@ -301,6 +304,79 @@ def merge_parquet(local_path, s3, bucket, key):
     os.remove("merged_tmp.parquet")
     print(f"Merged Parquet: {key}")
 
+def merge_tar_files(local_path, s3, bucket, key):
+    """Merge tar files by combining contents"""
+    import tarfile
+    import tempfile
+    
+    tmp_remote = "remote_tmp.tar"
+    tmp_merged = "merged_tmp.tar"
+    
+    try:
+        # Download existing tar
+        s3.download_file(bucket, key, tmp_remote)
+        
+        # Create merged tar
+        with tarfile.open(tmp_merged, 'w') as merged_tar:
+            # Add files from remote tar
+            with tarfile.open(tmp_remote, 'r') as remote_tar:
+                for member in remote_tar.getmembers():
+                    merged_tar.addfile(member, remote_tar.extractfile(member))
+            
+            # Add files from local tar (will overwrite if same name)
+            with tarfile.open(local_path, 'r') as local_tar:
+                for member in local_tar.getmembers():
+                    merged_tar.addfile(member, local_tar.extractfile(member))
+        
+        # Upload merged tar
+        upload_file(s3, tmp_merged, bucket, key)
+        
+        # Cleanup
+        os.remove(tmp_remote)
+        os.remove(tmp_merged)
+        print(f"Merged tar: {key}")
+        
+    except Exception as e:
+        print(f"Error merging tar {key}: {e}")
+        # Fallback to simple upload
+        upload_file(s3, local_path, bucket, key)
+
+def merge_tar_gz_files(local_path, s3, bucket, key):
+    """Merge tar.gz files by combining contents"""
+    import tarfile
+    
+    tmp_remote = "remote_tmp.tar.gz"
+    tmp_merged = "merged_tmp.tar.gz"
+    
+    try:
+        # Download existing tar.gz
+        s3.download_file(bucket, key, tmp_remote)
+        
+        # Create merged tar.gz
+        with tarfile.open(tmp_merged, 'w:gz') as merged_tar:
+            # Add files from remote tar.gz
+            with tarfile.open(tmp_remote, 'r:gz') as remote_tar:
+                for member in remote_tar.getmembers():
+                    merged_tar.addfile(member, remote_tar.extractfile(member))
+            
+            # Add files from local tar.gz (will overwrite if same name)
+            with tarfile.open(local_path, 'r:gz') as local_tar:
+                for member in local_tar.getmembers():
+                    merged_tar.addfile(member, local_tar.extractfile(member))
+        
+        # Upload merged tar.gz
+        upload_file(s3, tmp_merged, bucket, key)
+        
+        # Cleanup
+        os.remove(tmp_remote)
+        os.remove(tmp_merged)
+        print(f"Merged tar.gz: {key}")
+        
+    except Exception as e:
+        print(f"Error merging tar.gz {key}: {e}")
+        # Fallback to simple upload
+        upload_file(s3, local_path, bucket, key)
+
 def upload_and_merge_all():
     # Use the specified AWS profile for authentication
     session = boto3.Session(profile_name=AWS_PROFILE)
@@ -329,16 +405,27 @@ def upload_and_merge_all():
                 merge_parquet(local_path, s3, bucket, key)
             else:
                 upload_file(s3, local_path, bucket, key)
-        elif local_path.suffix in [".pdf", ".tar", ".gz"]:
+        elif local_path.suffix == ".tar":
             if exists:
-                tmp_remote = "remote_tmp.bin"
+                merge_tar_files(local_path, s3, bucket, key)
+            else:
+                upload_file(s3, local_path, bucket, key)
+        elif local_path.name.endswith(".tar.gz"):
+            if exists:
+                merge_tar_gz_files(local_path, s3, bucket, key)
+            else:
+                upload_file(s3, local_path, bucket, key)
+        elif local_path.suffix == ".pdf":
+            # PDFs can still use hash comparison since individual PDFs shouldn't change
+            if exists:
+                tmp_remote = "remote_tmp.pdf"
                 try:
                     s3.download_file(bucket, key, tmp_remote)
                     remote_hash = file_md5(tmp_remote)
                     local_hash = file_md5(local_path)
                     os.remove(tmp_remote)
                     if remote_hash == local_hash:
-                        print(f"Binary duplicate, skipping: {key}")
+                        print(f"PDF duplicate, skipping: {key}")
                         continue
                 except Exception:
                     pass
@@ -517,6 +604,7 @@ def main():
 def create_tar_and_parquet_files():
     """
     Create tar files for PDFs and parquet files for metadata
+    Also create tar.gz files for JSON metadata
     """
     print("Creating tar and parquet files...")
     
@@ -541,6 +629,12 @@ def create_tar_and_parquet_files():
                     parquet_path = bench_dir / "metadata.parquet"
                     if not parquet_path.exists():
                         create_parquet_from_json(json_files, parquet_path)
+                
+                # Create tar.gz from JSON files (metadata tar)
+                if json_files:
+                    metadata_tar_path = bench_dir / "metadata.tar.gz"
+                    if not metadata_tar_path.exists():
+                        create_metadata_tar_gz(bench_dir, metadata_tar_path)
                 
                 # Create tar from PDF files
                 pdf_files = list(bench_dir.glob("*.pdf"))
@@ -581,6 +675,20 @@ def create_tar_from_pdfs(pdf_files, output_path):
         print(f"Created tar: {output_path}")
     except Exception as e:
         print(f"Error creating tar {output_path}: {e}")
+
+def create_metadata_tar_gz(bench_dir, output_path):
+    """
+    Create a tar.gz file containing metadata JSON files for a bench
+    """
+    try:
+        import tarfile
+        
+        with tarfile.open(output_path, 'w:gz') as tar:
+            for json_file in bench_dir.glob("*.json"):
+                tar.add(json_file, arcname=json_file.name)
+        print(f"Created metadata tar.gz: {output_path}")
+    except Exception as e:
+        print(f"Error creating metadata tar.gz {output_path}: {e}")
 
 if __name__ == "__main__":
     main()
