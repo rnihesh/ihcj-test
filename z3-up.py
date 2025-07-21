@@ -165,8 +165,8 @@ def validate_and_correct_json(court_code_dl, date):
 
 def run_downloader(court_code_dl, start_date):
     # end_date = start_date + timedelta(days=1)
-    end_date = start_date
-    # end_date = datetime.now().date()
+    # end_date = start_date
+    end_date = datetime.now().date()
     print(f"\nRunning downloader for court={court_code_dl} from {start_date} to {end_date} ...")
     sys.stdout.flush()  # Force flush before subprocess
     
@@ -529,7 +529,6 @@ def main():
     session = boto3.Session(profile_name=AWS_PROFILE)
     s3_auth = session.client("s3")
 
-    test_court_code = "1_12"  # S3 format
     courts_and_benches = list_current_year_courts_and_benches(s3_unsigned, year)
     print(f"Found {len(courts_and_benches)} courts for year={year}")
 
@@ -554,10 +553,10 @@ def main():
         else:
             print(f"[LATEST] Court {court_code}: No dates found")
 
-    # Only process the test court code
-    if test_court_code in courts_and_benches:
+    # Process ALL courts instead of just the test court
+    for court_code in courts_and_benches:
         try:
-            bench_files = courts_and_benches[test_court_code]
+            bench_files = courts_and_benches[court_code]
             all_dates = set()
             for bench, files in bench_files.items():
                 for key in files:
@@ -571,21 +570,20 @@ def main():
                             continue
             
             if not all_dates:
-                print(f"[WARN] No valid dates found for court={test_court_code}")
-                return
+                print(f"[WARN] No valid dates found for court={court_code}")
+                continue
                 
-            court_code_dl = test_court_code.replace('_', '~')
+            court_code_dl = court_code.replace('_', '~')
             
-            print(f"[DEBUG] All dates for court {test_court_code}: {sorted(all_dates)}")
+            print(f"[DEBUG] All dates for court {court_code}: {sorted(all_dates)}")
             
-            # Process all dates for the test court
+            # Process all dates for this court
             for dt in sorted(all_dates):
                 run_downloader(court_code_dl, dt)
                 
         except Exception as e:
-            print(f"[ERROR] Failed to process court {test_court_code}: {str(e)}")
-    else:
-        print(f"[WARN] Test court code {test_court_code} not found in S3 data.")
+            print(f"[ERROR] Failed to process court {court_code}: {str(e)}")
+            continue  # Continue with next court even if one fails
 
     print("\nAll done downloading. Now reorganizing files...")
     
