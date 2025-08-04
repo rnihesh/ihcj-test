@@ -724,7 +724,7 @@ class Downloader:
                 captcha_filename.unlink()  # Clean up the file
                 return self.solve_captcha(retries + 1, captcha_url)
         else:
-            captcha_text = "".join([c for c in captch_text if c.isnumeric()])
+            captcha_text = "".join([c for c in captch_text if c.isalnum()])
             if len(captcha_text) != 6:
                 if retries > 10:
                     raise Exception("Captcha not solved")
