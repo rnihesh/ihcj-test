@@ -23,26 +23,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install boto3 tqdm pyarrow pandas
-          # Install any other dependencies your script needs
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1 # Change to the appropriate region
-          role-duration-seconds: 1200
-          role-session-name: GitHubActions
-
-      - name: Create AWS credentials file with profile
-        run: |
-          mkdir -p ~/.aws
-          echo "[dattam-high-anshu]" > ~/.aws/credentials
-          echo "aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> ~/.aws/credentials
-          echo "aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> ~/.aws/credentials
-          echo "region=ap-south-1" >> ~/.aws/credentials
+          aws-region: ap-south-1
 
       - name: Ensure directories exist
         run: |
@@ -50,7 +38,7 @@ jobs:
           mkdir -p ./data
 
       - name: Run court data pipeline
-        run: python z3-up.py
+        run: python download.py --sync-s3
 
       - name: Upload logs as artifacts
         uses: actions/upload-artifact@v4

@@ -17,8 +17,19 @@ import threading
 import concurrent.futures
 import urllib3
 import uuid
-# import ssl
-# ssl._create_default_https_context = ssl._create_unverified_context
+import os
+
+# S3 imports - only imported when needed
+try:
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.client import Config
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -48,6 +59,14 @@ captcha_failures_dir = Path("./captcha-failures")
 captcha_tmp_dir = Path("./captcha-tmp")
 captcha_failures_dir.mkdir(parents=True, exist_ok=True)
 captcha_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+# ---- S3 SYNC CONFIG ----
+S3_BUCKET = "indian-high-court-judgments"
+S3_PREFIX = "metadata/json/"
+LOCAL_DIR = "./local_hc_metadata"
+BENCH_CODES_FILE = "bench-codes.json"
+OUTPUT_DIR = output_dir  # Reuse existing output_dir
+TEST_BUCKET = S3_BUCKET + "-test"
 
 
 def get_json_file(file_path) -> dict:
@@ -150,7 +169,7 @@ def generate_tasks(
     court_codes: Optional[list[str]] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    day_step: int = 7,
+    day_step: int = 1,
 ) -> Generator[CourtDateTask, None, None]:
     """Generate tasks for processing courts and date ranges as a generator"""
     all_court_codes = get_court_codes()
@@ -188,16 +207,203 @@ def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_worker
     """
     # Create a task generator
     tasks = generate_tasks(court_codes, start_date, end_date, day_step)
+    
+    # Convert generator to list to get total count for progress bar
+    tasks_list = list(tasks)
+    total_tasks = len(tasks_list)
+    
+    if total_tasks == 0:
+        logger.info("No tasks to process")
+        return
+    
+    logger.info(f"🚀 Starting download with {total_tasks} tasks using {max_workers} workers")
 
     # Use ProcessPoolExecutor with map to process tasks in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # map automatically consumes the iterator and processes tasks in parallel
-        # it returns results in the same order as the input iterator
-        for i, result in enumerate(executor.map(process_task, tasks)):
-            # process_task doesn't return anything, so we're just tracking progress
-            logger.info(f"Completed task {i+1}")
+        # Use tqdm to show progress
+        with tqdm(total=total_tasks, desc="Processing tasks", unit="task") as pbar:
+            for i, result in enumerate(executor.map(process_task, tasks_list)):
+                # process_task doesn't return anything, so we're just tracking progress
+                pbar.set_postfix({"Completed": i+1})
+                pbar.update(1)
 
-    logger.info("All tasks completed")
+    logger.info("✅ All tasks completed successfully!")
+
+
+# ---- S3 SYNC FUNCTIONS ----
+def get_bench_codes():
+    """Load bench to court mappings from bench-codes.json"""
+    try:
+        with open(BENCH_CODES_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"[WARN] {BENCH_CODES_FILE} not found, using empty mapping")
+        return {}
+
+
+def list_current_year_courts_and_benches(s3, year):
+    """
+    Returns dict: { court_code: { bench: [json_files...] } }
+    """
+    prefix = f"{S3_PREFIX}year={year}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    result = {}
+
+    print(f"🔍 Scanning S3 for courts and benches with prefix: {prefix}")
+    total_keys = 0
+    
+    # First pass to count total pages for progress tracking
+    pages = list(paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix))
+    
+    with tqdm(total=len(pages), desc="Scanning S3 pages", unit="page") as pbar:
+        for page in pages:
+            contents = page.get("Contents", [])
+            pbar.set_postfix({"Keys in page": len(contents)})
+            
+            for obj in contents:
+                key = obj["Key"]
+                total_keys += 1
+                # key example: metadata/json/year=2025/court=1_12/bench=kashmirhc/JKHC010046902008_1_2020-09-21.json
+                # Parse using string operations instead of regex since we know the structure
+                if key.startswith(prefix) and key.endswith('.json'):
+                    # Remove prefix to get: court=1_12/bench=kashmirhc/JKHC010046902008_1_2020-09-21.json
+                    remaining = key[len(prefix):]
+                    parts = remaining.split('/')
+                    if len(parts) >= 3:
+                        # parts[0] = court=1_12, parts[1] = bench=kashmirhc, parts[2] = filename.json
+                        court_part = parts[0]
+                        bench_part = parts[1]
+                        
+                        if court_part.startswith('court=') and bench_part.startswith('bench='):
+                            court_code = court_part[6:]  # Remove 'court=' prefix
+                            bench = bench_part[6:]  # Remove 'bench=' prefix
+                            result.setdefault(court_code, {}).setdefault(bench, []).append(key)
+            pbar.update(1)
+    print(f"📊 Scan complete: {total_keys} total files found across {len(result)} courts")
+    return result
+
+
+def run_incremental_download(court_code_dl, start_date, end_date=None):
+    """
+    Run incremental download for a specific court and date using download.py functions directly
+    """
+    if end_date is None:
+        end_date = start_date + timedelta(days=1)  # For testing: only download next day
+    
+    print(f"\n⬇️  Running incremental download for court={court_code_dl} from {start_date} to {end_date} ...")
+    
+    try:
+        # Create a task for this court and date range
+        task = CourtDateTask(
+            court_code=court_code_dl,
+            from_date=start_date.strftime("%Y-%m-%d"),
+            to_date=end_date.strftime("%Y-%m-%d")
+        )
+        
+        # Process the task directly
+        process_task(task)
+        
+        print(f"✅ [SUCCESS] Completed download for court={court_code_dl} from {start_date} to {end_date}")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to download for court={court_code_dl}: {str(e)}")
+        raise
+
+
+def sync_to_s3():
+    """
+    Main S3 sync function - finds latest dates on S3 and downloads incremental data
+    """
+    if not S3_AVAILABLE:
+        print("[ERROR] S3 dependencies not available. Please install: pip install boto3 pyarrow pandas")
+        return
+    
+    year = datetime.now().year
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    
+    # For listing data, we still use unsigned access to the main bucket
+    s3_unsigned = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+
+    courts_and_benches = list_current_year_courts_and_benches(s3_unsigned, year)
+    print(f"🏛️  Found {len(courts_and_benches)} courts with data for year={year}")
+
+    # Print the latest date for every court with progress bar
+    print("\n📅 Finding latest dates for each court...")
+    for court_code, bench_files in tqdm(courts_and_benches.items(), desc="Finding latest dates", unit="court"):
+        all_dates = set()
+        for bench, files in bench_files.items():
+            for key in files:
+                # Extract date from key like: metadata/json/year=2025/court=1_12/bench=kashmirhc/JKHC010046902008_1_2020-09-21.json
+                # Instead of regex, use string operations since we know the structure
+                if key.endswith('.json'):
+                    filename = key.split('/')[-1]  # Get just the filename
+                    if '_' in filename and '-' in filename:
+                        # Find date pattern in filename
+                        parts = filename.split('_')
+                        if len(parts) >= 2:
+                            last_part = parts[-1]
+                            if '-' in last_part:
+                                date_part = last_part.replace('.json', '')  # Remove extension
+                                try:
+                                    d = datetime.strptime(date_part, "%Y-%m-%d").date()
+                                    if d <= datetime.now().date():
+                                        all_dates.add(d)
+                                    else:
+                                        print(f"[WARN] Skipping future date {d} in filename {key}")
+                                except ValueError:
+                                    continue
+        if all_dates:
+            latest = max(all_dates)
+            print(f"[LATEST] Court {court_code}: {latest}")
+        else:
+            print(f"[LATEST] Court {court_code}: No dates found")
+
+    # Process ALL courts instead of just the test court with progress bar
+    print("\n🏛️  Processing incremental downloads for courts...")
+    for court_code in tqdm(courts_and_benches, desc="Processing courts", unit="court"):
+        try:
+            bench_files = courts_and_benches[court_code]
+            all_dates = set()
+            for bench, files in bench_files.items():
+                for key in files:
+                    # Extract date from key using string operations instead of regex
+                    if key.endswith('.json'):
+                        filename = key.split('/')[-1]  # Get just the filename
+                        if '_' in filename and '-' in filename:
+                            # Find date pattern in filename
+                            parts = filename.split('_')
+                            if len(parts) >= 2:
+                                last_part = parts[-1]
+                                if '-' in last_part:
+                                    date_part = last_part.replace('.json', '')  # Remove extension
+                                    try:
+                                        d = datetime.strptime(date_part, "%Y-%m-%d").date()
+                                        if d.year == year and d <= datetime.now().date():
+                                            all_dates.add(d)
+                                    except ValueError:
+                                        continue
+            
+            if not all_dates:
+                print(f"[WARN] No valid dates found for court={court_code}")
+                continue
+                
+            court_code_dl = court_code.replace('_', '~')
+            
+            # For testing: only process from latest date to latest date + 1
+            latest_date = max(all_dates)
+            next_date = latest_date + timedelta(days=1)
+            
+            print(f"[DEBUG] Latest date for court {court_code}: {latest_date}")
+            print(f"[DEBUG] Will download from {latest_date} to {next_date}")
+            
+            # Only process the latest date to latest date + 1 for testing
+            run_incremental_download(court_code_dl, latest_date)
+                
+        except Exception as e:
+            print(f"❌ [ERROR] Failed to process court {court_code}: {str(e)}")
+            continue  # Continue with next court even if one fails
+
+    print("\n🎉 S3 sync completed successfully!")
 
 
 class Downloader:
@@ -415,8 +621,13 @@ class Downloader:
             return False
         with open(pdf_output_path, "wb") as f:
             f.write(pdf_response.content)
+        
+        # Convert bytes to human readable format
+        size_kb = no_of_bytes / 1024
+        size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
+        
         logger.debug(
-            f"Downloaded, task: {self.task}, output path: {pdf_output_path}, size: {no_of_bytes}"
+            f"✅ Downloaded PDF ({size_str}): {pdf_output_path.name}"
         )
         return True
 
@@ -513,7 +724,7 @@ class Downloader:
                 captcha_filename.unlink()  # Clean up the file
                 return self.solve_captcha(retries + 1, captcha_url)
         else:
-            captcha_text = "".join([c for c in captch_text if c.isalnum()])
+            captcha_text = "".join([c for c in captch_text if c.isnumeric()])
             if len(captcha_text) != 6:
                 if retries > 10:
                     raise Exception("Captcha not solved")
@@ -710,24 +921,31 @@ class Downloader:
                 response = self.request_api("POST", self.search_url, search_payload)
                 res_dict = response.json()
                 if self._results_exist_in_search_response(res_dict):
-                    for idx, row in enumerate(res_dict["reportrow"]["aaData"]):
-                        try:
-                            is_pdf_downloaded = self.process_result_row(
-                                row, row_pos=idx
-                            )
-                            if is_pdf_downloaded:
-                                pdfs_downloaded += 1
-                            if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
-                                # after 25 downloads, need to solve captcha for every pdf link request
-                                logger.info(
-                                    f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session, task: {self.task}"
+                    search_results = res_dict["reportrow"]["aaData"]
+                    # Add progress bar for processing search results
+                    with tqdm(total=len(search_results), desc="Processing results", leave=False, unit="result") as pbar:
+                        for idx, row in enumerate(search_results):
+                            try:
+                                is_pdf_downloaded = self.process_result_row(
+                                    row, row_pos=idx
                                 )
-                                break
-                        except Exception as e:
-                            logger.error(
-                                f"Error processing row {row}: {e}, task: {self.task}"
-                            )
-                            traceback.print_exc()
+                                if is_pdf_downloaded:
+                                    pdfs_downloaded += 1
+                                    pbar.set_postfix({"Downloaded": pdfs_downloaded})
+                                pbar.update(1)
+                                
+                                if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
+                                    # after 25 downloads, need to solve captcha for every pdf link request
+                                    logger.info(
+                                        f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session, task: {self.task}"
+                                    )
+                                    break
+
+                            except Exception as e:
+                                logger.error(
+                                    f"Error processing row {row}: {e}, task: {self.task}"
+                                )
+                                traceback.print_exc()
 
                     if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                         pdfs_downloaded = 0
@@ -764,22 +982,27 @@ if __name__ == "__main__":
         help="End date in YYYY-MM-DD format",
     )
     parser.add_argument(
-        "--day_step", type=int, default=7, help="Number of days per chunk"
+        "--day_step", type=int, default=1, help="Number of days per chunk"
     )
     parser.add_argument("--max_workers", type=int, default=2, help="Number of workers")
+    parser.add_argument("--sync-s3", action="store_true", help="Run S3 sync to download incremental data and sync to S3")
     args = parser.parse_args()
 
-    if args.court_codes:
-        assert (
-            args.court_code is None
-        ), "court_code and court_codes cannot both be provided"
-        court_codes = args.court_codes.split(",")
-    elif args.court_code:
-        court_codes = [args.court_code]
+    # Handle S3 sync mode
+    if args.sync_s3:
+        sync_to_s3()
     else:
-        court_codes = get_court_codes()
+        # Regular download mode
+        if args.court_codes:
+            assert (
+                args.court_code is None
+            ), "court_code and court_codes cannot both be provided"
+            court_codes = args.court_codes.split(",")
+        elif args.court_code:
+            court_codes = [args.court_code]
+        else:
+            court_codes = None
 
-    for court_code in court_codes:
         run(
             court_codes, args.start_date, args.end_date, args.day_step, args.max_workers
         )
