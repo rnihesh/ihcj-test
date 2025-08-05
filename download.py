@@ -358,9 +358,16 @@ def sync_to_s3():
         else:
             print(f"[LATEST] Court {court_code}: No dates found")
 
-    # Process ALL courts instead of just the test court with progress bar
+    # Process only court 8~9 for GitHub Actions testing
     print("\n🏛️  Processing incremental downloads for courts...")
-    for court_code in tqdm(courts_and_benches, desc="Processing courts", unit="court"):
+    # Filter to only process court 8~9 (note: S3 uses underscore format)
+    test_court = "8_9"
+    if test_court not in courts_and_benches:
+        print(f"[WARN] Test court {test_court} not found in S3 data")
+        return
+    
+    courts_to_process = {test_court: courts_and_benches[test_court]}
+    for court_code in tqdm(courts_to_process, desc="Processing courts", unit="court"):
         try:
             bench_files = courts_and_benches[court_code]
             all_dates = set()
