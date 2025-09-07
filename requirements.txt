@@ -6,4 +6,4 @@ easyocr
 boto3
 pyarrow
 pandas
-
+pyexiftool
